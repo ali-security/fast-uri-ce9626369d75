@@ -1,18 +1,12 @@
 name: package-manager-ci
 
 on:
-  push:
-    branches:
-     - main
-     - next
-     - 'v*'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
+  # Deviation from upstream: the `push` / `pull_request` triggers are removed so
+  # the fork's sync push cannot fire this reusable-workflow call (it would run
+  # yarn/pnpm/npm installs the seal build does not need). The build never
+  # dispatches it; `workflow_dispatch` is here only because a workflow needs at
+  # least one trigger to be valid.
+  workflow_dispatch:
 
 permissions:
   contents: read

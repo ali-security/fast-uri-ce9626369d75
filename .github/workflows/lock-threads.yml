@@ -1,8 +1,9 @@
 name: Lock Threads
 
 on:
-  schedule:
-    - cron: '0 0 1 * *'
+  # Deviation from upstream: the `schedule` trigger is removed so this
+  # issue/PR-locking workflow cannot fire by itself on the build fork. The build
+  # never dispatches it. `workflow_dispatch` is kept exactly as upstream had it.
   workflow_dispatch:
 
 concurrency:

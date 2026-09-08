@@ -1,18 +1,17 @@
 name: CI
 
 on:
-  push:
-    branches:
-     - main
-     - next
-     - 'v*'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
+  # Deviation from upstream: the `push` / `pull_request` triggers are removed and
+  # `workflow_dispatch` added. On the build fork the sync push would fire this
+  # workflow immediately and burn a run nobody asked for, and the build needs to
+  # dispatch it explicitly (a workflow with no `workflow_dispatch` cannot be
+  # dispatched at all).
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Substring of the test file name(s) to run; empty runs the full suite'
+        required: false
+        default: ''
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -26,6 +25,7 @@ jobs:
   test-regression-check-node10:
     name: Test compatibility with Node.js 10
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -52,14 +52,26 @@ jobs:
           cp ./index.js ./node_modules/fast-uri/index.js
 
       - name: Run tests
+        # Deviation from upstream's `npm run test:unit`: npm 6 (the npm bundled
+        # with Node.js 10) applies this repo's .npmrc `ignore-scripts=true` to
+        # `npm run` as well, so `npm run test:unit` exits 0 having run ZERO
+        # tests -- a silently masked no-test leg. Invoking the tape binary
+        # directly runs the real suite. `test/*.js` selects exactly the same 11
+        # files that tape's own globstar expansion of `test/**/*.js` selects
+        # (test/fixtures holds only .json), so coverage is unchanged.
         run: |
-          npm run test:unit
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            node ./node_modules/.bin/tape test/*"${{ inputs.test-filter }}"*.js
+          else
+            node ./node_modules/.bin/tape test/*.js
+          fi
         env:
           NODE_OPTIONS: no-network-family-autoselection
 
   test-browser:
     name: Test browser compatibility
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -93,14 +105,91 @@ jobs:
         run: |
           npm run test:browser:${{ matrix.browser }}
 
+  # Deviation from upstream: this job was
+  #   uses: fastify/workflows/.github/workflows/plugins-ci.yml@v6
+  #   with: { license-check: true, lint: true, node-versions: '["16","18","20","22","24"]' }
+  # and is replaced by the inline equivalent below. Two reasons: a job that calls
+  # a reusable workflow cannot carry `timeout-minutes`, which the build harness
+  # requires on every job; and the reusable workflow pulls in `contents: write` /
+  # `pull-requests: write` permissions plus lint and license-check gates that a
+  # fork cannot satisfy. The node-version matrix (16/18/20/22/24) and the
+  # `npm test` command are preserved verbatim, and the OS axis is widened from
+  # the reusable workflow's ubuntu-only default to ubuntu/windows/macos. Lint and
+  # license-check are not tests -- they never execute package code -- so they are
+  # intentionally dropped.
   test:
+    name: Test Node.js ${{ matrix.node-version }} on ${{ matrix.os }}
     needs:
       - test-regression-check-node10
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     permissions:
-      contents: write
-      pull-requests: write
-    uses: fastify/workflows/.github/workflows/plugins-ci.yml@v6
-    with:
-      license-check: true
-      lint: true
-      node-versions: '["16", "18", "20", "22", "24"]'
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-latest', 'windows-latest', 'macos-latest']
+        node-version: ['16', '18', '20', '22', '24']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # No `cache: 'npm'` here: the repo has no lockfile (.npmrc sets
+      # package-lock=false), so `cache-dependency-path: package.json` keys the
+      # cache on a file that does not describe the resolved tree.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          check-latest: true
+
+      - name: Install
+        run: |
+          npm install --ignore-scripts
+
+      # `npm test` == `npm run test:unit && npm run test:typescript`
+      # (tape over test/**/*.js, then tsd). npm 7+ honours an explicitly
+      # requested `npm run`/`npm test` script despite .npmrc ignore-scripts, so
+      # unlike the Node 10 leg this really does run the suite.
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx tape test/*"${{ inputs.test-filter }}"*.js
+          else
+            npm test
+          fi
+
+  # Added job: upstream ships no workflow that packs the release tarball, so the
+  # pack + upload steps are added here. Gated on every test job so no artifact is
+  # produced by a red run.
+  pack:
+    name: Pack npm tarball
+    needs:
+      - test
+      - test-browser
+      - test-regression-check-node10
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Node.js 24 ships npm 11, the npm that packed the published tarball.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          check-latest: true
+
+      - name: Pack
+        run: |
+          npm pack --ignore-scripts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-uri-tarball
+          path: fast-uri-3.1.4.tgz
+          if-no-files-found: error
