@@ -3,6 +3,21 @@
 const { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = require('./lib/utils')
 const { SCHEMES, getSchemeHandler } = require('./lib/schemes')
 
+const VALID_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/u
+const MALFORMED_SCHEME_ERROR = 'URI scheme is malformed.'
+
+/**
+ * @param {string} scheme
+ * @returns {string}
+ */
+function decodeValidScheme (scheme) {
+  const decodedScheme = unescape(String(scheme))
+  if (!VALID_SCHEME.test(decodedScheme)) {
+    throw new TypeError(MALFORMED_SCHEME_ERROR)
+  }
+  return decodedScheme
+}
+
 /**
  * @template {import('./types/index').URIComponent|string} T
  * @param {T} uri
@@ -29,18 +44,22 @@ function resolve (baseURI, relativeURI, options) {
   const {
     parsed: baseParsed,
     malformedAuthorityOrPort: baseMalformed,
-    malformedHost: baseMalformedHost
+    malformedHost: baseMalformedHost,
+    malformedScheme: baseMalformedScheme
   } = parseWithStatus(baseURI, schemelessOptions)
   const {
     parsed: relativeParsed,
     malformedAuthorityOrPort: relativeMalformed,
-    malformedHost: relativeMalformedHost
+    malformedHost: relativeMalformedHost,
+    malformedScheme: relativeMalformedScheme
   } = parseWithStatus(relativeURI, schemelessOptions)
   if (
     baseMalformed ||
     relativeMalformed ||
     baseMalformedHost ||
-    relativeMalformedHost
+    relativeMalformedHost ||
+    baseMalformedScheme ||
+    relativeMalformedScheme
   ) {
     throw new Error(baseParsed.error || relativeParsed.error || 'URI is malformed.')
   }
@@ -168,6 +187,10 @@ function serialize (cmpts, opts) {
   const options = Object.assign({}, opts)
   const uriTokens = []
 
+  if (component.scheme) {
+    component.scheme = decodeValidScheme(component.scheme)
+  }
+
   // find scheme handler
   const schemeHandler = getSchemeHandler(options.scheme || component.scheme)
 
@@ -187,6 +210,8 @@ function serialize (cmpts, opts) {
   }
 
   if (options.reference !== 'suffix' && component.scheme) {
+    // Scheme handlers may replace the scheme during serialization.
+    component.scheme = decodeValidScheme(component.scheme)
     uriTokens.push(component.scheme, ':')
   }
 
@@ -298,7 +323,7 @@ function canonicalizeHost (parsed, options, schemeHandler, isIP) {
 /**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean, malformedHost: boolean }}
+ * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean, malformedHost: boolean, malformedScheme: boolean }}
  */
 function parseWithStatus (uri, opts) {
   const options = Object.assign({}, opts)
@@ -316,6 +341,7 @@ function parseWithStatus (uri, opts) {
   let malformedAuthorityOrPort = false
   let malformedHost = false
   let malformedIPLiteral = false
+  let malformedScheme = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -373,6 +399,21 @@ function parseWithStatus (uri, opts) {
     parsed.query = matches[7]
     parsed.fragment = matches[8]
 
+    // The scheme is percent-decoded before it is used, so it must be decoded
+    // and validated here -- before the scheme handler is selected and before
+    // the components are serialized. Decoding it afterwards lets an encoded
+    // scheme ("ht%74ps:", "%2f%2fevil.example:") pick a different handler than
+    // the one it serializes to, and can smuggle delimiters into the output.
+    if (parsed.scheme !== undefined) {
+      const decodedScheme = unescape(parsed.scheme)
+      if (VALID_SCHEME.test(decodedScheme)) {
+        parsed.scheme = decodedScheme.toLowerCase()
+      } else {
+        parsed.error = parsed.error || MALFORMED_SCHEME_ERROR
+        malformedScheme = true
+      }
+    }
+
     // fix port number
     if (isNaN(parsed.port)) {
       parsed.port = matches[5]
@@ -424,9 +465,6 @@ function parseWithStatus (uri, opts) {
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
       if (uri.indexOf('%') !== -1) {
-        if (parsed.scheme !== undefined) {
-          parsed.scheme = unescape(parsed.scheme)
-        }
         if (parsed.host !== undefined && !malformedIPLiteral) {
           const host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true)
           parsed.host = reescapeHostDelimiters(host, isIP)
@@ -451,7 +489,7 @@ function parseWithStatus (uri, opts) {
   } else {
     parsed.error = parsed.error || 'URI can not be parsed.'
   }
-  return { parsed, malformedAuthorityOrPort, malformedHost }
+  return { parsed, malformedAuthorityOrPort, malformedHost, malformedScheme }
 }
 
 /**
@@ -475,14 +513,15 @@ function normalizeString (uri, opts) {
 /**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ normalized: string, malformedAuthorityOrPort: boolean, malformedHost: boolean }}
+ * @returns {{ normalized: string, malformedAuthorityOrPort: boolean, malformedHost: boolean, malformedScheme: boolean }}
  */
 function normalizeStringWithStatus (uri, opts) {
-  const { parsed, malformedAuthorityOrPort, malformedHost } = parseWithStatus(uri, opts)
+  const { parsed, malformedAuthorityOrPort, malformedHost, malformedScheme } = parseWithStatus(uri, opts)
   return {
-    normalized: malformedAuthorityOrPort || malformedHost ? uri : serialize(parsed, opts),
+    normalized: malformedAuthorityOrPort || malformedHost || malformedScheme ? uri : serialize(parsed, opts),
     malformedAuthorityOrPort,
-    malformedHost
+    malformedHost,
+    malformedScheme
   }
 }
 
@@ -493,12 +532,18 @@ function normalizeStringWithStatus (uri, opts) {
  */
 function normalizeComparableURI (uri, opts) {
   if (typeof uri === 'string') {
-    const { normalized, malformedAuthorityOrPort, malformedHost } = normalizeStringWithStatus(uri, opts)
-    return malformedAuthorityOrPort || malformedHost ? undefined : normalized
+    const { normalized, malformedAuthorityOrPort, malformedHost, malformedScheme } = normalizeStringWithStatus(uri, opts)
+    return malformedAuthorityOrPort || malformedHost || malformedScheme ? undefined : normalized
   }
 
   if (typeof uri === 'object') {
-    return serialize(uri, opts)
+    // A component object carrying a malformed scheme cannot be serialized, so
+    // equality must fail closed rather than propagate the error.
+    try {
+      return serialize(uri, opts)
+    } catch {
+      return undefined
+    }
   }
 }
 
